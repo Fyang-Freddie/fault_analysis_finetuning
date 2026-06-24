@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.py[cod]
+
+models/
+papers_failure_analysis/
+
+*.jsonl
+*.errors.jsonl
+*.summary.json
+*.raw/
