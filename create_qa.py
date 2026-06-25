@@ -108,6 +108,9 @@ SYSTEM_PROMPT = r"""你是一名核电、火电、石化行业通用设备失效
 
 15. JSON 中不得出现注释、尾随逗号或非法转义字符。
 
+16. 请你严格按照最高上限 {max_new_tokens} token 限制输出，不要超过。
+
+
 输出格式：
 
 [
@@ -125,6 +128,10 @@ SYSTEM_PROMPT = r"""你是一名核电、火电、石化行业通用设备失效
 }
 ]
 """
+
+
+def build_system_prompt(max_tokens: int) -> str:
+    return SYSTEM_PROMPT.replace("{max_new_tokens}", str(max_tokens))
 
 
 USER_PROMPT_TEMPLATE = """请从下面 PDF 文本片段中抽取高质量中文 QA 对。
@@ -222,7 +229,6 @@ REVIEW_PROMPT = """你是一名失效分析数据集质量审核专家。请检�
 待审核 QA：
 {qa_json}
 """
-
 
 
 @dataclass
@@ -410,14 +416,36 @@ def is_article_specific_question(question: str) -> bool:
     return any(pattern in question for pattern in ARTICLE_SPECIFIC_PATTERNS)
 
 
-def validate_qa_items(items: Iterable[Dict[str, Any]]) -> List[Dict[str, str]]:
-    cleaned: List[Dict[str, str]] = []
+OPTIONAL_QA_FIELDS = [
+    "qa_type",
+    "domain",
+    "sub_domain",
+    "equipment",
+    "failure_mode",
+    "analysis_method",
+    "source_pdf",
+]
+
+
+def normalize_analysis_steps(item: Dict[str, Any]) -> List[str]:
+    raw_steps = item.get("analysis_steps")
+    if raw_steps is None:
+        raw_steps = item.get("thinking")
+    if isinstance(raw_steps, list):
+        return [str(step).strip() for step in raw_steps if str(step).strip()]
+    if isinstance(raw_steps, str):
+        return [step.strip() for step in raw_steps.splitlines() if step.strip()]
+    return []
+
+
+def validate_qa_items(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
     seen = set()
     for item in items:
         if not isinstance(item, dict):
             continue
         question = str(item.get("question", "")).strip()
-        thinking = str(item.get("thinking", "")).strip()
+        analysis_steps = normalize_analysis_steps(item)
         answer = str(item.get("answer", "")).strip()
         if not question or not answer:
             continue
@@ -429,12 +457,14 @@ def validate_qa_items(items: Iterable[Dict[str, Any]]) -> List[Dict[str, str]]:
         seen.add(key)
         cleaned_item = {
             "question": question,
-            "thinking": thinking,
+            "analysis_steps": analysis_steps,
             "answer": answer,
         }
-        qa_type = str(item.get("qa_type", "")).strip()
-        if qa_type:
-            cleaned_item["qa_type"] = qa_type
+        for field in OPTIONAL_QA_FIELDS:
+            value = item.get(field)
+            if value in (None, "", []):
+                continue
+            cleaned_item[field] = value
         cleaned.append(cleaned_item)
     return cleaned
 
@@ -458,7 +488,7 @@ def build_user_prompt(chunk: Chunk, max_pairs: Optional[int]) -> str:
     )
 
 
-def build_review_prompt(chunk: Chunk, qa_items: List[Dict[str, str]]) -> str:
+def build_review_prompt(chunk: Chunk, qa_items: List[Dict[str, Any]]) -> str:
     return REVIEW_PROMPT.format(
         text=chunk.text,
         qa_json=json.dumps(qa_items, ensure_ascii=False, indent=2),
@@ -486,6 +516,7 @@ class OpenAICompatibleClient(QwenClient):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.system_prompt = build_system_prompt(max_tokens)
 
     def chat(self, messages: List[Dict[str, str]]) -> str:
         response = self.client.chat.completions.create(
@@ -499,7 +530,7 @@ class OpenAICompatibleClient(QwenClient):
     def generate(self, chunk: Chunk, max_pairs: Optional[int]) -> str:
         return self.chat(
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": build_user_prompt(chunk, max_pairs)},
             ]
         )
@@ -556,6 +587,7 @@ class TransformersClient(QwenClient):
         self.model = AutoModelForCausalLM.from_pretrained(model_ref, **load_kwargs)
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
+        self.system_prompt = build_system_prompt(max_new_tokens)
         print(f"模型加载完成: {model_ref}", flush=True)
         device_map = getattr(self.model, "hf_device_map", self.model.device)
         print(f"模型设备映射: {device_map}", flush=True)
@@ -594,7 +626,7 @@ class TransformersClient(QwenClient):
     def generate(self, chunk: Chunk, max_pairs: Optional[int]) -> str:
         return self.generate_messages(
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": build_user_prompt(chunk, max_pairs)},
             ],
             stage="生成",
@@ -898,7 +930,7 @@ def parse_args() -> argparse.Namespace:
         "--output-format",
         choices=["with_source", "simple"],
         default="with_source",
-        help="with_source 会附带 PDF/页码/chunk_id；simple 只输出 question/thinking/answer",
+        help="with_source 会附带 PDF/页码/chunk_id；simple 只输出模型生成的 QA 字段",
     )
     parser.add_argument("--resume", action="store_true", help="跳过输出文件中已有的 source_pdf + chunk_id")
     parser.add_argument("--overwrite", action="store_true", help="覆盖输出文件；未设置时默认追加")
