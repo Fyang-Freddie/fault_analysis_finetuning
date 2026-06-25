@@ -36,7 +36,7 @@ python create_qa.py --backend qwen --quantization 4bit --dtype bfloat16 --gpu-me
 小样本测试：
 
 ```powershell
-python create_qa.py --backend qwen --limit 2 --max-pages 5 --max-tokens 1024 --quantization 4bit --dtype bfloat16 --gpu-memory 10GiB --review --overwrite --output qa_professional_sample.jsonl
+python create_qa.py --backend qwen --limit 2 --max-pages 10 --max-tokens 2048 --quantization 4bit --dtype bfloat16 --gpu-memory 10GiB --review --overwrite --output qa_professional_sample.jsonl
 ```
 
 ## 3. 使用 GLM 5.2 API
