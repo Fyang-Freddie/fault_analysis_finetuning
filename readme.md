@@ -59,7 +59,63 @@ python create_qa.py --backend glm --max-tokens 4096 --review --overwrite
 python create_qa.py --backend glm --limit 2 --max-pages 5 --max-tokens 4096 --review --overwrite --output qa_glm_sample.jsonl
 ```
 
-## 4. 文本输入模式
+## 4. 使用通用 API 脚本
+
+`create_qa_api.py` 是按 OpenAI 兼容接口新写的 API 版本，默认读取 `papers_failure_analysis` 下的 PDF，并输出到 `qa_api.jsonl`。
+
+推荐在 `.env` 中配置：
+
+```env
+API_BASE_URL=http://120.26.36.89:18080/v1
+API_KEY=你的API_KEY
+API_MODEL=glm-latest
+```
+
+也兼容读取 `GLM_BASE_URL`、`GLM_API_KEY`、`GLM_MODEL`。
+
+测试接口是否可用：
+
+```powershell
+python test.py
+```
+
+小样本生成：
+
+```powershell
+python create_qa_api.py --limit 2 --max-pages 5 --overwrite --output qa_api_sample.jsonl
+```
+
+指定接口和模型：
+
+```powershell
+python create_qa_api.py --base-url http://120.26.36.89:18080/v1 --model glm-latest --limit 2 --overwrite
+```
+
+断点续写：
+
+```powershell
+python create_qa_api.py --resume
+```
+
+全部重写：
+
+```powershell
+python create_qa_api.py --overwrite
+```
+
+如果大 PDF 出现连接错误，可以调小分块：
+
+```powershell
+python create_qa_api.py --pages-per-chunk 15 --resume
+```
+
+如需生成后再让模型审核一次：
+
+```powershell
+python create_qa_api.py --review --limit 2 --overwrite
+```
+
+## 5. 文本输入模式
 
 默认使用 `--chunk-mode auto`：
 
@@ -73,7 +129,9 @@ python create_qa.py --backend glm --chunk-mode chunk
 python create_qa.py --backend qwen --chunk-mode file
 ```
 
-## 5. 常用参数
+`create_qa_api.py` 默认按页分块，`--pages-per-chunk` 默认为 30。也就是超过 30 页的 PDF 会按每 30 页一个 chunk 处理；单个页组文本仍然过长时，再按 `--chunk-chars` 做保护性切分。
+
+## 6. 常用参数
 
 - `--input`：PDF 文件或 PDF 文件夹，默认 `papers_failure_analysis`。
 - `--output`：输出 JSONL 文件，默认 `qa_qwen3_8b.jsonl`。
@@ -83,3 +141,6 @@ python create_qa.py --backend qwen --chunk-mode file
 - `--pairs-per-chunk`：可选上限；不传时由模型根据文本信息密度自主判断生成多少个 QA。
 - `--max-tokens`：模型最大输出 token 数。
 - `--stats-only`：只统计已有输出，不调用模型。
+- `--pages-per-chunk`：`create_qa_api.py` 每个 chunk 包含的最大页数，默认 30。
+- `--chunk-chars`：`create_qa_api.py` 单个页组过长时的字符切分上限。
+- `--base-url`、`--api-key`、`--model`：`create_qa_api.py` 可用这些参数覆盖 `.env` 中的 API 配置。
