@@ -5,21 +5,37 @@ import time
 import requests
 from urllib.parse import urlparse
 
-SAVE_DIR = "papers_failure_analysis"
+SAVE_DIR = "papers_failure_analysis2"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 EMAIL = "yf2028813437@outlook.com"  # Unpaywall 要求填写邮箱
 
+# QUERIES = [
+#     "failure analysis stainless steel pipe stress corrosion cracking SEM metallography",
+#     "failure analysis power plant pipe cracking SEM metallography",
+#     "failure analysis nuclear power plant stainless steel tube SCC",
+#     "failure analysis heat exchanger tube cracking SEM metallography",
+#     "failure analysis valve leakage stress corrosion cracking",
+#     "failure analysis boiler tube power plant SEM",
+#     "failure analysis pump shaft fracture SEM",
+#     "failure analysis turbine blade cracking metallography",
+#     "failure analysis steam pipe cracking creep",
+# ]
 QUERIES = [
-    "failure analysis stainless steel pipe stress corrosion cracking SEM metallography",
-    "failure analysis power plant pipe cracking SEM metallography",
-    "failure analysis nuclear power plant stainless steel tube SCC",
-    "failure analysis heat exchanger tube cracking SEM metallography",
-    "failure analysis valve leakage stress corrosion cracking",
-    "failure analysis boiler tube power plant SEM",
-    "failure analysis pump shaft fracture SEM",
-    "failure analysis turbine blade cracking metallography",
-    "failure analysis steam pipe cracking creep",
+    "nuclear power plant failure analysis",
+    "nuclear power plant pipe failure analysis",
+    "nuclear power plant stainless steel tube failure",
+    "thermal power plant failure analysis",
+    "boiler tube failure analysis",
+    "power plant steam pipe failure analysis",
+    "metallurgical failure analysis power plant",
+    "failure analysis of boiler tube",
+    "failure analysis of stainless steel pipe",
+    "failure analysis SEM metallography hardness",
+    "核电 设备 失效分析",
+    "核电 管道 失效分析",
+    "火电 设备 失效分析",
+    "火电 锅炉管 失效分析"
 ]
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -80,6 +96,7 @@ def search_openalex(query, per_page=50):
         "search": query,
         "per-page": per_page,
         "filter": "is_oa:true",
+        "mailto":"yf2028813437@outlook.com"
     }
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=30)

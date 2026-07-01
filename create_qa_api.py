@@ -447,10 +447,23 @@ def iter_pdf_paths(input_path: Path, limit: Optional[int]) -> List[Path]:
     return pdfs
 
 
-def load_done_keys(output_path: Path) -> set[tuple[str, int]]:
+def load_summary_rows(summary_path: Path) -> List[Dict[str, Any]]:
+    if not summary_path.exists():
+        return []
+    try:
+        with summary_path.open("r", encoding="utf-8") as f:
+            rows = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def load_resume_key(output_path: Path) -> Optional[tuple[str, int]]:
     if not output_path.exists():
-        return set()
-    done = set()
+        return None
+    resume_key: Optional[tuple[str, int]] = None
     with output_path.open("r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -460,8 +473,17 @@ def load_done_keys(output_path: Path) -> set[tuple[str, int]]:
             source_pdf = row.get("source_pdf")
             chunk_id = row.get("chunk_id")
             if source_pdf and isinstance(chunk_id, int):
-                done.add((source_pdf, chunk_id))
-    return done
+                resume_key = (source_pdf, chunk_id)
+    return resume_key
+
+
+def upsert_summary_row(rows: List[Dict[str, Any]], pdf_summary: Dict[str, Any]) -> None:
+    source_pdf = pdf_summary.get("source_pdf")
+    for index, row in enumerate(rows):
+        if row.get("source_pdf") == source_pdf:
+            rows[index] = pdf_summary
+            return
+    rows.append(pdf_summary)
 
 
 def write_rows(output_path: Path, rows: List[Dict[str, Any]], append: bool) -> None:
@@ -566,12 +588,18 @@ def main() -> None:
         raise SystemExit(f"没有找到 PDF：{input_path}")
 
     client = make_client(args)
-    done_keys = load_done_keys(output_path) if args.resume else set()
+    resume_key = load_resume_key(output_path) if args.resume else None
+    resume_pending = resume_key is not None
     first_write = args.overwrite or not output_path.exists()
     total_rows = 0
-    summary_rows: List[Dict[str, Any]] = []
+    summary_rows = load_summary_rows(summary_path) if args.resume else []
+    if args.resume and resume_key:
+        print(f"Resume from after {resume_key[0]} chunk {resume_key[1]}", flush=True)
 
     for pdf_index, pdf_path in enumerate(pdf_paths, start=1):
+        if resume_pending and resume_key and pdf_path.name != resume_key[0]:
+            print(f"[{pdf_index}/{len(pdf_paths)}] Skip before resume marker PDF: {pdf_path.name}", flush=True)
+            continue
         print(f"[{pdf_index}/{len(pdf_paths)}] 读取 PDF: {pdf_path.name}", flush=True)
         pdf_summary: Dict[str, Any] = {
             "source_pdf": pdf_path.name,
@@ -581,6 +609,14 @@ def main() -> None:
             "failed_chunks": 0,
             "qa_pairs": 0,
         }
+        if args.resume:
+            for row in summary_rows:
+                if row.get("source_pdf") == pdf_path.name:
+                    for field in ("success_chunks", "failed_chunks", "qa_pairs"):
+                        value = row.get(field)
+                        if isinstance(value, int):
+                            pdf_summary[field] = value
+                    break
 
         try:
             pages = extract_pdf_pages(pdf_path, args.max_pages)
@@ -592,7 +628,7 @@ def main() -> None:
             write_rows(error_path, [error], append=True)
             pdf_summary["failed_chunks"] = 1
             pdf_summary["error"] = str(exc)
-            summary_rows.append(pdf_summary)
+            upsert_summary_row(summary_rows, pdf_summary)
             write_summary(summary_path, summary_rows)
             print(f"  跳过：{exc}", flush=True)
             continue
@@ -600,10 +636,13 @@ def main() -> None:
         print(f"  页数文本块: {len(pages)} pages, {len(chunks)} chunks", flush=True)
         for chunk in chunks:
             key = (chunk.source_pdf, chunk.chunk_id)
-            if key in done_keys:
-                print(f"  跳过已完成 chunk {chunk.chunk_id}", flush=True)
+            if resume_pending:
+                if key == resume_key:
+                    resume_pending = False
+                    print(f"  Resume marker reached, skip completed chunk {chunk.chunk_id}", flush=True)
+                else:
+                    print(f"  Skip before resume marker chunk {chunk.chunk_id}", flush=True)
                 continue
-
             try:
                 print(
                     f"  chunk {chunk.chunk_id}/{len(chunks)}: pages={chunk.page_start}-{chunk.page_end}, chars={len(chunk.text)}",
@@ -632,13 +671,16 @@ def main() -> None:
             if args.sleep:
                 time.sleep(args.sleep)
 
-        summary_rows.append(pdf_summary)
+        upsert_summary_row(summary_rows, pdf_summary)
         write_summary(summary_path, summary_rows)
         print(
             f"  PDF汇总: qa_pairs={pdf_summary['qa_pairs']}, "
             f"success_chunks={pdf_summary['success_chunks']}, failed_chunks={pdf_summary['failed_chunks']}",
             flush=True,
         )
+
+    if resume_pending and resume_key:
+        print(f"Resume marker not found: {resume_key[0]} chunk {resume_key[1]}", flush=True)
 
     print(f"完成：本次写入 {total_rows} 条 QA -> {output_path}", flush=True)
     print(f"按 PDF 汇总：{summary_path}", flush=True)
