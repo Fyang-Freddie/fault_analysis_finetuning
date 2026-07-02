@@ -59,7 +59,7 @@ python create_qa.py --backend glm --max-tokens 4096 --review --overwrite
 python create_qa.py --backend glm --limit 2 --max-pages 5 --max-tokens 4096 --review --overwrite --output qa_glm_sample.jsonl
 ```
 
-## 4. 使用通用 API 脚本
+## 4. 使用 PDF 通用 API 脚本：create_qa_api.py
 
 `create_qa_api.py` 是按 OpenAI 兼容接口新写的 API 版本，默认读取 `papers_failure_analysis` 下的 PDF，并输出到 `qa_api.jsonl`。
 
@@ -115,7 +115,64 @@ python create_qa_api.py --pages-per-chunk 15 --resume
 python create_qa_api.py --review --limit 2 --overwrite
 ```
 
-## 5. 文本输入模式
+### create_qa_api.py 常用参数
+
+- `--input`：PDF 文件或 PDF 文件夹，默认 `papers_failure_analysis`。
+- `--output`：输出 JSONL 文件，默认 `qa_api.jsonl`。
+- `--resume`：跳过输出文件中已有的 `source_pdf + chunk_id`。
+- `--overwrite`：覆盖输出文件。
+- `--review`：生成后再调用模型审核一次，只保留审核通过的 QA。
+- `--pages-per-chunk`：每个 chunk 包含的最大页数，默认 30。
+- `--chunk-chars`：单个页组过长时的字符切分上限，默认 12000。
+- `--pairs-per-chunk`：可选上限；不传时由模型根据文本信息密度自主判断生成多少个 QA。
+- `--max-tokens`：模型最大输出 token 数，默认 4096。
+- `--base-url`、`--api-key`、`--model`：覆盖 `.env` 中的 API 配置。
+
+## 5. 使用 Word API 脚本：create_qa_word.py
+
+`create_qa_word.py` 用于处理 Word 文档，默认读取 `papers_failure_analysis2` 下的 `.docx` 文件，并输出到 `qa_word.jsonl`。
+
+该脚本会把整篇 Word 文档清洗后一次传给模型生成 QA。写入 JSONL 时，会为每条数据补充统一字段：
+
+- `qa_type`：由 `--qa_type` 传入，默认空字符串。
+- `source_pdf`：当前处理的 Word 文件名。
+- `page_start`：固定为 `0`。
+- `page_end`：固定为 `0`。
+- `chunk_id`：固定为 `1`。
+
+断点续写：
+
+```powershell
+python create_qa_word.py --write_mode resume --qa_type failure_analysis
+```
+
+`resume` 是默认模式，也可以简写为：
+
+```powershell
+python create_qa_word.py --qa_type failure_analysis
+```
+
+全部重写：
+
+```powershell
+python create_qa_word.py --write_mode rewrite --qa_type failure_analysis
+```
+
+指定输入和输出：
+
+```powershell
+python create_qa_word.py --input_folder papers_failure_analysis2 --output_file qa_word.jsonl --error_file error_log.txt --qa_type failure_analysis
+```
+
+### create_qa_word.py 常用参数
+
+- `--input_folder`：Word 文件夹，默认 `papers_failure_analysis2`。
+- `--output_file`：输出 JSONL 文件，默认 `qa_word.jsonl`。
+- `--error_file`：错误日志文件，默认 `error_log.txt`。
+- `--qa_type`：写入每条 JSON 数据的 `qa_type` 字段。
+- `--write_mode`：写入模式，支持 `resume` 和 `rewrite`，默认 `resume`。
+
+## 6. 文本输入模式
 
 默认使用 `--chunk-mode auto`：
 
@@ -131,16 +188,4 @@ python create_qa.py --backend qwen --chunk-mode file
 
 `create_qa_api.py` 默认按页分块，`--pages-per-chunk` 默认为 30。也就是超过 30 页的 PDF 会按每 30 页一个 chunk 处理；单个页组文本仍然过长时，再按 `--chunk-chars` 做保护性切分。
 
-## 6. 常用参数
-
-- `--input`：PDF 文件或 PDF 文件夹，默认 `papers_failure_analysis`。
-- `--output`：输出 JSONL 文件，默认 `qa_qwen3_8b.jsonl`。
-- `--resume`：跳过输出文件中已有的 `source_pdf + chunk_id`。
-- `--overwrite`：覆盖输出文件。
-- `--review`：生成后再调用模型审核一次，只保留审核通过的 QA。
-- `--pairs-per-chunk`：可选上限；不传时由模型根据文本信息密度自主判断生成多少个 QA。
-- `--max-tokens`：模型最大输出 token 数。
-- `--stats-only`：只统计已有输出，不调用模型。
-- `--pages-per-chunk`：`create_qa_api.py` 每个 chunk 包含的最大页数，默认 30。
-- `--chunk-chars`：`create_qa_api.py` 单个页组过长时的字符切分上限。
-- `--base-url`、`--api-key`、`--model`：`create_qa_api.py` 可用这些参数覆盖 `.env` 中的 API 配置。
+`create_qa_word.py` 默认不按页切分，整篇 Word 文档作为一个输入块处理，因此写出的 `chunk_id` 固定为 `1`，`page_start` 和 `page_end` 固定为 `0`。
