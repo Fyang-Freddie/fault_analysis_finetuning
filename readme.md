@@ -82,7 +82,7 @@ python create_qa.py --backend glm --input papers_failure_analysis --output qa_gl
 ### 基本用法
 
 ```powershell
-python create_qa_api.py --input papers_failure_analysis --output qa_api.jsonl --overwrite
+python create_qa_api.py --input papers_failure_analysis --output qa_api_facts.jsonl --overwrite
 ```
 
 处理单个 PDF：
@@ -100,7 +100,7 @@ python create_qa_api.py --input papers_failure_analysis --limit 2 --max-pages 5 
 断点续写：
 
 ```powershell
-python create_qa_api.py --input papers_failure_analysis --output qa_api.jsonl --resume
+python create_qa_api.py --input papers_failure_analysis --output qa_api_facts.jsonl --resume
 ```
 
 大 PDF 请求不稳定时，可以调小每个 chunk 的页数：

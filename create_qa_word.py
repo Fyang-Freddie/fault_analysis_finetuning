@@ -14,6 +14,7 @@ load_dotenv()
 
 GLM_API_KEY = os.getenv("API_KEY")
 GLM_BASE_URL = os.getenv("API_BASE_URL")
+GLM_MODEL = os.getenv("API_MODEL") or "glm-latest"
 
 client = OpenAI(
     api_key=GLM_API_KEY,
@@ -432,7 +433,7 @@ def call_glm_generate(cleaned_text: str) -> str:
 """
 
     resp = client.chat.completions.create(
-        model="glm-latest",
+        model=GLM_MODEL,
         messages=[
             {"role": "user", "content": user_content}
         ],
