@@ -21,10 +21,10 @@ client = OpenAI(
     base_url=GLM_BASE_URL
 )
 
+MIN_CHUNK_CHARS = 6000
+MAX_CHUNK_CHARS = 12000
 
-# =========================
-# 2. 这里填写你自己的提示词
-# =========================
+
 GENERATION_PROMPT ="""
 你是一名工业设备失效分析专家，熟悉核电、火电、石化、钢铁、船舶、矿山等场景中的通用设备失效分析，包括管道、阀门、水泵、风机、换热器、压力容器、紧固件、轴承、焊接接头、密封件等设备或部件。
 
@@ -413,6 +413,108 @@ def extract_docx_content(docx_path: str, extract_tables: bool = True) -> str:
     return "\n".join(cleaned_lines)
 
 
+def is_section_title(line: str) -> bool:
+    """
+    判断清洗后的行是否像章节标题。
+    """
+
+    line = line.strip()
+
+    if not line or len(line) > 50:
+        return False
+
+    title_patterns = [
+        r"^第[一二三四五六七八九十百\d]+[章节部分篇]\s*",
+        r"^[一二三四五六七八九十]+[、.．]\s*\S+",
+        r"^\d+(\.\d+)*[、.．]?\s+\S+",
+    ]
+
+    return any(re.match(pattern, line) for pattern in title_patterns)
+
+
+def split_text_by_sections(cleaned_text: str) -> list:
+    """
+    按章节组织 chunk：短章节合并，长章节单独作为一个 chunk。
+    """
+
+    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    sections = []
+    current_section = []
+
+    for line in lines:
+        if is_section_title(line) and current_section:
+            sections.append("\n".join(current_section))
+            current_section = [line]
+        else:
+            current_section.append(line)
+
+    if current_section:
+        sections.append("\n".join(current_section))
+
+    if len(sections) == 1:
+        return split_text_by_max_chars(sections[0])
+
+    chunks = []
+    current_chunk = ""
+
+    for section in sections:
+        section_len = len(section)
+
+        if section_len >= MIN_CHUNK_CHARS:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            chunks.append(section)
+            continue
+
+        if not current_chunk:
+            current_chunk = section
+        elif len(current_chunk) + section_len + 1 <= MAX_CHUNK_CHARS:
+            current_chunk = current_chunk + "\n" + section
+        else:
+            chunks.append(current_chunk)
+            current_chunk = section
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def split_text_by_max_chars(text: str) -> list:
+    """
+    未识别出章节时，按 MAX_CHUNK_CHARS 顺序切分文本。
+    """
+
+    chunks = []
+    current_chunk = ""
+
+    for line in [line.strip() for line in text.splitlines() if line.strip()]:
+        if len(line) > MAX_CHUNK_CHARS:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            for start in range(0, len(line), MAX_CHUNK_CHARS):
+                chunks.append(line[start:start + MAX_CHUNK_CHARS])
+            continue
+
+        if not current_chunk:
+            current_chunk = line
+        elif len(current_chunk) + len(line) + 1 <= MAX_CHUNK_CHARS:
+            current_chunk = current_chunk + "\n" + line
+        else:
+            chunks.append(current_chunk)
+            current_chunk = line
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
 def call_glm_generate(cleaned_text: str) -> str:
     """
     将清洗后的文本输入 GLM 模型，生成数据。
@@ -437,7 +539,8 @@ def call_glm_generate(cleaned_text: str) -> str:
         messages=[
             {"role": "user", "content": user_content}
         ],
-        temperature=0
+        temperature=0,
+        timeout=300.0
     )
 
     return resp.choices[0].message.content
@@ -462,7 +565,7 @@ def get_last_jsonl_record(output_path: str):
     return None
 
 
-def save_to_jsonl(output_path: str, generated_data: str, source_pdf: str, qa_type: str):
+def save_to_jsonl(output_path: str, generated_data: str, source_pdf: str, qa_type: str, chunk_id: int):
     """
     将模型生成的 JSONL 数据补充固定字段后追加写入 jsonl 文件。
     """
@@ -479,7 +582,7 @@ def save_to_jsonl(output_path: str, generated_data: str, source_pdf: str, qa_typ
             item["source_pdf"] = source_pdf
             item["page_start"] = 0
             item["page_end"] = 0
-            item["chunk_id"] = 1
+            item["chunk_id"] = chunk_id
 
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
             saved_count += 1
@@ -501,7 +604,12 @@ def main():
     error_file = args.error_file
 
     if args.write_mode == "rewrite":
-        open(output_file, "w", encoding="utf-8").close()
+        confirm = input(f"确认要覆盖 {output_file} 吗？输入 'yes' 确认：")
+        if confirm.lower() != "yes":
+            print("操作已取消")
+            return
+        else:
+            open(output_file, "w", encoding="utf-8").close()
 
     filenames = [
         filename for filename in os.listdir(input_folder)
@@ -527,27 +635,37 @@ def main():
 
             # 1. 先清洗当前文件
             text = extract_docx_content(file_path, extract_tables=False)
+            print("处理之后的文本内容如下：")
+            print("=" * 80)
+            print(text)
 
             if not text.strip():
                 print(f"{filename} 清洗后文本为空，跳过")
                 continue
 
-            print("文本清洗完成，正在调用 GLM 模型生成数据...")
+            chunks = split_text_by_sections(text)
+            print(f"文本清洗完成，已切分为 {len(chunks)} 个 chunk，正在调用 GLM 模型生成数据...")
 
-            # 2. 当前文件清洗完成后，立即调用模型生成
-            generated_data = call_glm_generate(text)
+            total_saved_count = 0
+            for chunk_id, chunk_text in enumerate(chunks, start=1):
+                print(f"正在处理 chunk {chunk_id}/{len(chunks)}...")
 
-            print("模型生成完成，正在写入 qa_word.jsonl...")
+                # 2. 按章节 chunk 依次调用模型生成
+                generated_data = call_glm_generate(chunk_text)
 
-            # 3. 补充固定字段后写入 JSONL 文件
-            saved_count = save_to_jsonl(
-                output_path=output_file,
-                generated_data=generated_data,
-                source_pdf=filename,
-                qa_type=args.qa_type
-            )
+                print("模型生成完成，正在写入 qa_word.jsonl...")
 
-            print(f"{filename} 已保存完成，写入 {saved_count} 条数据")
+                # 3. 补充固定字段后写入 JSONL 文件
+                saved_count = save_to_jsonl(
+                    output_path=output_file,
+                    generated_data=generated_data,
+                    source_pdf=filename,
+                    qa_type=args.qa_type,
+                    chunk_id=chunk_id
+                )
+                total_saved_count += saved_count
+
+            print(f"{filename} 已保存完成，写入 {total_saved_count} 条数据")
             print("=" * 80)
 
         except Exception as e:
