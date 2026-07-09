@@ -540,7 +540,7 @@ def call_glm_generate(cleaned_text: str) -> str:
             {"role": "user", "content": user_content}
         ],
         temperature=0,
-        timeout=300.0
+        timeout=600.0
     )
 
     return resp.choices[0].message.content
