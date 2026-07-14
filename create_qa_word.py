@@ -2,7 +2,12 @@ from docx import Document
 import argparse
 import re
 import os
+import sys
+import io
 import json
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -21,8 +26,46 @@ client = OpenAI(
     base_url=GLM_BASE_URL
 )
 
-MIN_CHUNK_CHARS = 6000
+MIN_CHUNK_CHARS = 6000 
 MAX_CHUNK_CHARS = 12000
+
+# 日志配置：同时输出到文件（UTF-8，不受控制台编码影响）和控制台。
+# 控制台 handler 用一个能容错编码的包装，避免在 GBK 控制台（部分 Windows Server）
+# 打印中文时抛 UnicodeEncodeError（表现为刷屏 "Logging error ... in emit"）。
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+# 文件 handler：始终 UTF-8，保证完整日志落盘可回溯
+_file_handler = logging.FileHandler("data/run_word.log", mode="a", encoding="utf-8")
+_file_handler.setFormatter(_log_formatter)
+
+# 控制台 handler：强制以 UTF-8 输出。优先 reconfigure，失败则用 TextIOWrapper
+# 直接包装底层 buffer，彻底绕开 Python 判定的 GBK 编码（部分 Windows Server 上
+# reconfigure 不足以生效，会刷屏 "Logging error ... in emit"）。
+_console_stream = sys.stdout
+try:
+    if hasattr(_console_stream, "reconfigure"):
+        _console_stream.reconfigure(encoding="utf-8", errors="replace")
+    elif hasattr(_console_stream, "buffer"):
+        _console_stream = io.TextIOWrapper(
+            _console_stream.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+except Exception:
+    # 兜底：即便包装失败，也让控制台 handler 用容错编码，不影响文件日志
+    if hasattr(sys.stdout, "buffer"):
+        try:
+            _console_stream = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+        except Exception:
+            _console_stream = sys.stdout
+_console_handler = logging.StreamHandler(_console_stream)
+_console_handler.setFormatter(_log_formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
+logger = logging.getLogger("create_qa_word")
 
 
 GENERATION_PROMPT ="""
@@ -383,7 +426,14 @@ def extract_docx_content(docx_path: str, extract_tables: bool = True) -> str:
         str: 清洗后的完整文本内容
     """
 
-    doc = Document(docx_path)
+    try:
+        doc = Document(docx_path)
+    except Exception as e:
+        # 常见于：老的 .doc 被改名成 .docx、文件损坏或空文件。
+        # python-docx 只支持 OOXML 格式的 .docx。
+        raise ValueError(
+            f"无法作为 .docx 打开（可能是老式 .doc 改名、损坏或空文件）：{e}"
+        )
     content_parts = []
 
     # 1. 提取普通段落
@@ -515,17 +565,23 @@ def split_text_by_max_chars(text: str) -> list:
     return chunks
 
 
-def call_glm_generate(cleaned_text: str) -> str:
+def call_glm_generate(cleaned_text: str, max_retries: int = 3) -> str:
     """
-    将清洗后的文本输入 GLM 模型，生成数据。
+    将清洗后的文本输入 GLM 模型，生成数据。带指数退避重试。
 
     参数:
-        cleaned_text: 单篇 docx 清洗后的文本
+        cleaned_text: 单个 chunk 清洗后的文本
+        max_retries: 最大尝试次数（含首次）
 
     返回:
-        str: GLM 模型生成结果
+        str: GLM 模型生成结果（保证非空）
+
+    异常:
+        重试耗尽后抛出最后一次异常。
     """
 
+    # 部分自定义/私有部署端点不支持 system role，遇到会返回非标准响应，
+    # 故沿用单条 user 消息，将 prompt 与文本拼接（与原始可用版本保持一致）
     user_content = f"""
 {GENERATION_PROMPT}
 
@@ -533,61 +589,190 @@ def call_glm_generate(cleaned_text: str) -> str:
 
 {cleaned_text}
 """
+    messages = [
+        {"role": "user", "content": user_content},
+    ]
 
-    resp = client.chat.completions.create(
-        model=GLM_MODEL,
-        messages=[
-            {"role": "user", "content": user_content}
-        ],
-        temperature=0,
-        timeout=600.0
-    )
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=GLM_MODEL,
+                messages=messages,
+                temperature=0,
+                timeout=1800.0,  # 单次调用超时 30 分钟
+            )
 
-    return resp.choices[0].message.content
+            content = resp.choices[0].message.content
+            if content is None or not content.strip():
+                raise ValueError("模型返回空内容")
+
+            return content
+
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                sleep_s = min(2 ** attempt, 30)
+                logger.warning("模型调用失败（第 %d/%d 次）：%s，%d 秒后重试",
+                               attempt, max_retries, e, sleep_s)
+                time.sleep(sleep_s)
+
+    raise last_err
 
 
-def get_last_jsonl_record(output_path: str):
+def _strip_code_fence(text: str) -> str:
     """
-    读取 jsonl 文件最后一条非空 JSON 数据，用于断点续写。
+    剥离模型输出中可能存在的 ```json / ``` 代码块围栏。
     """
+
+    text = text.strip()
+
+    if not text.startswith("```"):
+        return text
+
+    lines = text.splitlines()
+
+    # 去掉首行的 ``` 或 ```json
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+
+    # 去掉末行的 ```
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+
+    return "\n".join(lines)
+
+
+def parse_generated_records(generated_data: str, source_pdf: str, qa_type: str, chunk_id: int):
+    """
+    解析模型生成的 JSONL 文本为记录列表，逐行容错。
+
+    返回:
+        (records, bad_count): 解析成功的记录列表，以及解析失败的行数
+    """
+
+    records = []
+    bad_count = 0
+
+    cleaned = _strip_code_fence(generated_data)
+
+    for line in cleaned.splitlines():
+        line = line.strip()
+
+        if not line or line.startswith("```"):
+            continue
+
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            bad_count += 1
+            logger.warning("[%s] chunk %d 跳过无法解析的行：%s",
+                           source_pdf, chunk_id, line[:80])
+            continue
+
+        item["qa_type"] = qa_type
+        item["source_pdf"] = source_pdf
+        item["page_start"] = 0
+        item["page_end"] = 0
+        item["chunk_id"] = chunk_id
+
+        records.append(item)
+
+    return records, bad_count
+
+
+def process_one_file(file_path: str, filename: str, qa_type: str, max_retries: int) -> dict:
+    """
+    处理单个 docx 文件：提取清洗 → 切 chunk → 逐 chunk 调用模型并解析。
+
+    文件内所有 chunk 全部在内存收集，任一 chunk 重试耗尽仍失败会抛异常，
+    从而保证“要么整文件成功、要么整文件失败”的原子性（不写半截数据）。
+
+    返回:
+        dict: {filename, records, bad, chunks, empty}
+    """
+
+    text = extract_docx_content(file_path, extract_tables=False)
+
+    if not text.strip():
+        return {"filename": filename, "records": [], "bad": 0, "chunks": 0, "empty": True}
+
+    chunks = split_text_by_sections(text)
+    logger.info("[%s] 清洗完成（%d 字），切分为 %d 个 chunk", filename, len(text), len(chunks))
+
+    all_records = []
+    total_bad = 0
+
+    for chunk_id, chunk_text in enumerate(chunks, start=1):
+        generated_data = call_glm_generate(chunk_text, max_retries=max_retries)
+        records, bad = parse_generated_records(generated_data, filename, qa_type, chunk_id)
+        all_records.extend(records)
+        total_bad += bad
+
+    return {
+        "filename": filename,
+        "records": all_records,
+        "bad": total_bad,
+        "chunks": len(chunks),
+        "empty": False,
+    }
+
+
+def append_records(output_path: str, records: list):
+    """
+    将记录列表追加写入 jsonl 文件（由主线程串行调用，无需加锁）。
+    """
+
+    with open(output_path, "a", encoding="utf-8") as f:
+        for item in records:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def load_done_set(done_path: str) -> set:
+    """
+    读取已完整处理文件清单。
+    """
+
+    if not os.path.exists(done_path):
+        return set()
+
+    with open(done_path, "r", encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def mark_done(done_path: str, filename: str):
+    """
+    将一个已完整处理的文件追加到清单。
+    """
+
+    with open(done_path, "a", encoding="utf-8") as f:
+        f.write(filename + "\n")
+
+
+def collect_source_pdfs_from_jsonl(output_path: str) -> set:
+    """
+    从已有 jsonl 结果中收集出现过的 source_pdf，用于兼容旧数据的断点迁移。
+    """
+
+    result = set()
 
     if not os.path.exists(output_path):
-        return None
+        return result
 
     with open(output_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    for line in reversed(lines):
-        line = line.strip()
-        if line:
-            return json.loads(line)
-
-    return None
-
-
-def save_to_jsonl(output_path: str, generated_data: str, source_pdf: str, qa_type: str, chunk_id: int):
-    """
-    将模型生成的 JSONL 数据补充固定字段后追加写入 jsonl 文件。
-    """
-
-    saved_count = 0
-    with open(output_path, "a", encoding="utf-8") as f:
-        for line in generated_data.strip().splitlines():
+        for line in f:
             line = line.strip()
             if not line:
                 continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            src = item.get("source_pdf")
+            if src:
+                result.add(src)
 
-            item = json.loads(line)
-            item["qa_type"] = qa_type
-            item["source_pdf"] = source_pdf
-            item["page_start"] = 0
-            item["page_end"] = 0
-            item["chunk_id"] = chunk_id
-
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-            saved_count += 1
-
-    return saved_count
+    return result
 
 
 def main():
@@ -597,84 +782,106 @@ def main():
     parser.add_argument("--error_file", default="error_log.txt")
     parser.add_argument("--qa_type", default="")
     parser.add_argument("--write_mode", choices=["resume", "rewrite"], default="resume")
+    parser.add_argument("--max_workers", type=int, default=4, help="文件间并发数")
+    parser.add_argument("--max_retries", type=int, default=3, help="单次模型调用最大尝试次数")
     args = parser.parse_args()
+
+    # 启动诊断：定位工作目录与输入目录，便于排查“路径/挂载”类卡顿或读不到文件
+    logger.info("脚本启动 [build=utf8-fix-2]，stdout 编码：%s，工作目录：%s",
+                getattr(sys.stdout, "encoding", "?"), os.getcwd())
+    logger.info("输入目录参数：%s -> 绝对路径：%s（存在：%s）",
+                args.input_folder, os.path.abspath(args.input_folder),
+                os.path.isdir(args.input_folder))
+
+    # 配置校验：尽早发现 .env 未配置的问题，而不是等第一次 API 调用才失败
+    if not GLM_API_KEY or not GLM_BASE_URL:
+        logger.error("API_KEY / API_BASE_URL 未配置，请检查 .env 文件")
+        return
 
     input_folder = args.input_folder
     output_file = args.output_file
     error_file = args.error_file
+    done_file = output_file + ".done"  # 已完整处理文件清单
+
+    if not os.path.isdir(input_folder):
+        logger.error("输入目录不存在：%s", input_folder)
+        return
 
     if args.write_mode == "rewrite":
         confirm = input(f"确认要覆盖 {output_file} 吗？输入 'yes' 确认：")
         if confirm.lower() != "yes":
-            print("操作已取消")
+            logger.info("操作已取消")
             return
-        else:
-            open(output_file, "w", encoding="utf-8").close()
+        open(output_file, "w", encoding="utf-8").close()
+        open(done_file, "w", encoding="utf-8").close()  # 同步清空进度清单
 
-    filenames = [
+    # 固定顺序，保证多次运行文件列表一致
+    filenames = sorted(
         filename for filename in os.listdir(input_folder)
         if filename.lower().endswith(".docx") and not filename.startswith("~$")
-    ]
+    )
 
+    done_set = set()
     if args.write_mode == "resume":
-        last_record = get_last_jsonl_record(output_file)
-        if last_record:
-            last_source_pdf = last_record.get("source_pdf")
-            if last_source_pdf in filenames:
-                last_index = filenames.index(last_source_pdf)
-                filenames = filenames[last_index + 1:]
-                print(f"断点续写：从 {last_source_pdf} 之后继续处理")
-            else:
-                print("断点续写：最后一条数据未匹配到当前文件夹中的文件，将从头开始处理")
+        done_set = load_done_set(done_file)
 
-    for filename in filenames:
-        file_path = os.path.join(input_folder, filename)
+        # 兼容旧数据：清单不存在但已有 jsonl 结果时，用其中的 source_pdf 初始化进度
+        if not done_set and os.path.exists(output_file):
+            migrated = collect_source_pdfs_from_jsonl(output_file)
+            if migrated:
+                for name in sorted(migrated):
+                    mark_done(done_file, name)
+                done_set = migrated
+                logger.info("检测到旧 jsonl 结果，已迁移 %d 个文件到进度清单", len(migrated))
 
-        try:
-            print(f"正在处理：{filename}")
+    todo = [f for f in filenames if f not in done_set]
 
-            # 1. 先清洗当前文件
-            text = extract_docx_content(file_path, extract_tables=False)
-            print("处理之后的文本内容如下：")
-            print("=" * 80)
-            print(text)
+    if not todo:
+        logger.info("没有需要处理的文件（共 %d 个，已完成 %d 个）", len(filenames), len(done_set))
+        return
 
-            if not text.strip():
-                print(f"{filename} 清洗后文本为空，跳过")
-                continue
+    logger.info("待处理 %d 个文件（已完成 %d 个），并发数 %d",
+                len(todo), len(done_set), args.max_workers)
 
-            chunks = split_text_by_sections(text)
-            print(f"文本清洗完成，已切分为 {len(chunks)} 个 chunk，正在调用 GLM 模型生成数据...")
+    grand_total = 0
 
-            total_saved_count = 0
-            for chunk_id, chunk_text in enumerate(chunks, start=1):
-                print(f"正在处理 chunk {chunk_id}/{len(chunks)}...")
+    # 文件间并发；每个 worker 返回整文件结果，由主线程串行写入并登记，保证写入原子性与断点可靠
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        future_to_name = {
+            executor.submit(
+                process_one_file,
+                os.path.join(input_folder, filename),
+                filename,
+                args.qa_type,
+                args.max_retries,
+            ): filename
+            for filename in todo
+        }
 
-                # 2. 按章节 chunk 依次调用模型生成
-                generated_data = call_glm_generate(chunk_text)
+        for future in as_completed(future_to_name):
+            filename = future_to_name[future]
+            try:
+                result = future.result()
 
-                print("模型生成完成，正在写入 qa_word.jsonl...")
+                if result["empty"]:
+                    logger.warning("[%s] 清洗后文本为空，跳过", filename)
+                    mark_done(done_file, filename)  # 空文件也登记，避免重复处理
+                    continue
 
-                # 3. 补充固定字段后写入 JSONL 文件
-                saved_count = save_to_jsonl(
-                    output_path=output_file,
-                    generated_data=generated_data,
-                    source_pdf=filename,
-                    qa_type=args.qa_type,
-                    chunk_id=chunk_id
-                )
-                total_saved_count += saved_count
+                append_records(output_file, result["records"])
+                mark_done(done_file, filename)
+                grand_total += len(result["records"])
 
-            print(f"{filename} 已保存完成，写入 {total_saved_count} 条数据")
-            print("=" * 80)
+                bad_note = f"，丢弃坏行 {result['bad']} 条" if result["bad"] else ""
+                logger.info("[%s] 完成，写入 %d 条数据%s", filename, len(result["records"]), bad_note)
 
-        except Exception as e:
-            print(f"{filename} 处理失败：{e}")
+            except Exception as e:
+                logger.error("[%s] 处理失败：%s", filename, e)
+                with open(error_file, "a", encoding="utf-8") as f:
+                    f.write(f"{filename}\t{str(e)}\n")
 
-            with open(error_file, "a", encoding="utf-8") as f:
-                f.write(f"{filename}\t{str(e)}\n")
+    logger.info("全部结束，本次共写入 %d 条数据", grand_total)
 
-            print("=" * 80)
 
 if __name__ == "__main__":
     main()

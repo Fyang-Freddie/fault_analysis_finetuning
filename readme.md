@@ -100,7 +100,7 @@ python create_qa_api.py --input papers_failure_analysis --limit 2 --max-pages 5 
 断点续写：
 
 ```powershell
-python create_qa_api.py --input papers_failure_analysis --output qa_api_facts.jsonl --resume
+python create_qa_api.py --input papers_failure_analysis --output data/qa_api_facts.jsonl --resume
 ```
 
 大 PDF 请求不稳定时，可以调小每个 chunk 的页数：

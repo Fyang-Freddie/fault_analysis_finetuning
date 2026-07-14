@@ -1,3 +1,4 @@
+from docx import Document
 import pdfplumber
 import argparse
 import re
@@ -28,6 +29,8 @@ client = OpenAI(
 
 MIN_CHUNK_CHARS = 6000
 MAX_CHUNK_CHARS = 12000
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # 日志配置：同时输出到文件（UTF-8，不受控制台编码影响）和控制台。
 # 控制台 handler 用一个能容错编码的包装，避免在 GBK 控制台（部分 Windows Server）
@@ -38,7 +41,9 @@ _log_formatter = logging.Formatter(
 )
 
 # 文件 handler：始终 UTF-8，保证完整日志落盘可回溯
-_file_handler = logging.FileHandler("data/run_pdf.log", mode="a", encoding="utf-8")
+_file_handler = logging.FileHandler(
+    os.path.join(DATA_DIR, "run_word.log"), mode="a", encoding="utf-8"
+)
 _file_handler.setFormatter(_log_formatter)
 
 # 控制台 handler：强制以 UTF-8 输出。优先 reconfigure，失败则用 TextIOWrapper
@@ -414,15 +419,58 @@ def clean_text_lines(lines: list) -> list:
     return cleaned
 
 
-def extract_pdf_content(pdf_path: str) -> str:
+def extract_docx_content(docx_path: str, extract_tables: bool = True) -> str:
     """
-    提取并清洗单个 PDF 文件中的文本内容。
+    提取并清洗单个 docx 文件中的文本内容。
 
     参数:
-        pdf_path: PDF 文件路径
+        docx_path: docx 文件路径
+        extract_tables: 是否提取表格内容，默认提取
 
     返回:
         str: 清洗后的完整文本内容
+    """
+
+    try:
+        doc = Document(docx_path)
+    except Exception as e:
+        # 常见于：老的 .doc 被改名成 .docx、文件损坏或空文件。
+        # python-docx 只支持 OOXML 格式的 .docx。
+        raise ValueError(
+            f"无法作为 .docx 打开（可能是老式 .doc 改名、损坏或空文件）：{e}"
+        )
+    content_parts = []
+
+    # 1. 提取普通段落
+    for paragraph in doc.paragraphs:
+        text = paragraph.text.strip()
+        if text:
+            content_parts.append(text)
+
+    # 2. 提取表格内容
+    if extract_tables:
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = []
+
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+
+                    if cell_text and not is_noise_line(cell_text):
+                        row_text.append(cell_text)
+
+                if row_text:
+                    content_parts.append(" | ".join(row_text))
+
+    # 3. 清洗噪声行
+    cleaned_lines = clean_text_lines(content_parts)
+
+    return "\n".join(cleaned_lines)
+
+
+def extract_pdf_content(pdf_path: str) -> str:
+    """
+    提取并清洗单个 PDF 文件中的文本内容。
     """
 
     try:
@@ -431,15 +479,14 @@ def extract_pdf_content(pdf_path: str) -> str:
         raise ValueError(
             f"无法作为 PDF 打开（文件可能损坏、加密或为空）：{e}"
         )
+
     content_parts = []
 
-    # 1. 按页提取文本
     with pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             content_parts.extend(text.splitlines())
 
-    # 2. 清洗噪声行
     cleaned_lines = clean_text_lines(content_parts)
 
     return "\n".join(cleaned_lines)
@@ -665,7 +712,7 @@ def parse_generated_records(generated_data: str, source_pdf: str, qa_type: str, 
 
 def process_one_file(file_path: str, filename: str, qa_type: str, max_retries: int) -> dict:
     """
-    处理单个 PDF 文件：提取清洗 → 切 chunk → 逐 chunk 调用模型并解析。
+    处理单个 Word 或 PDF 文件：提取清洗 → 切 chunk → 逐 chunk 调用模型并解析。
 
     文件内所有 chunk 全部在内存收集，任一 chunk 重试耗尽仍失败会抛异常，
     从而保证“要么整文件成功、要么整文件失败”的原子性（不写半截数据）。
@@ -674,7 +721,10 @@ def process_one_file(file_path: str, filename: str, qa_type: str, max_retries: i
         dict: {filename, records, bad, chunks, empty}
     """
 
-    text = extract_pdf_content(file_path)
+    if filename.lower().endswith(".pdf"):
+        text = extract_pdf_content(file_path)
+    else:
+        text = extract_docx_content(file_path, extract_tables=False)
 
     if not text.strip():
         return {"filename": filename, "records": [], "bad": 0, "chunks": 0, "empty": True}
@@ -760,8 +810,8 @@ def collect_source_pdfs_from_jsonl(output_path: str) -> set:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_folder", default="papers_failure_analysis2")
-    parser.add_argument("--output_file", default="qa_word.jsonl")
-    parser.add_argument("--error_file", default="error_log.txt")
+    parser.add_argument("--output_file", default=os.path.join(DATA_DIR, "qa_word_pdf.jsonl"))
+    parser.add_argument("--error_file", default=os.path.join(DATA_DIR, "error_log_word_pdf.txt"))
     parser.add_argument("--qa_type", default="")
     parser.add_argument("--write_mode", choices=["resume", "rewrite"], default="resume")
     parser.add_argument("--max_workers", type=int, default=4, help="文件间并发数")
@@ -800,7 +850,7 @@ def main():
     # 固定顺序，保证多次运行文件列表一致
     filenames = sorted(
         filename for filename in os.listdir(input_folder)
-        if filename.lower().endswith(".pdf")
+        if filename.lower().endswith((".docx", ".pdf")) and not filename.startswith("~$")
     )
 
     done_set = set()
