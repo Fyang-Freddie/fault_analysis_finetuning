@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input_dir",
         type=str,
-        default="data/markdown/markdown",
+        default="data/markdown",
         help="存放 Markdown 文件的目录。",
     )
     parser.add_argument(
